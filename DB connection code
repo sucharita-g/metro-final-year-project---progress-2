@@ -1,0 +1,456 @@
+// =======================
+// Imports
+// =======================
+const express = require("express");
+const { v4: uuidv4 } = require("uuid");
+const QRCode = require("qrcode");
+const mongoose = require("mongoose");
+require("dotenv").config();
+const connectDB = require("./src/config/db");
+
+// =======================
+// App Setup
+// =======================
+const app = express();
+app.use(express.json());
+const port = 3000;
+
+// =======================
+// Schemas & Models
+// =======================
+
+// Booking Schema
+const bookingSchema = new mongoose.Schema({
+  bookingId: { type: String, required: true, unique: true },
+  source: String,
+  destination: String,
+  persons: Number,
+  fare: Number,
+  status: {
+    type: String,
+    enum: ["PENDING", "CONFIRMED", "CANCELLED"],
+    default: "PENDING",
+  },
+  paymentId: String,
+  createdAt: { type: Date, default: Date.now },
+});
+
+const Booking = mongoose.model("Bookings", bookingSchema);
+
+// Station Schema
+const Station = mongoose.model(
+  "stations",
+  new mongoose.Schema({
+    name: String,
+    code: String,
+    line: String,
+    neighbours: [String],
+  })
+);
+
+// =======================
+// Utility: BFS Path Finder
+// =======================
+const findPathBFS = (stationsMap, source, destination) => {
+  const queue = [[source]];
+  const visited = new Set();
+
+  while (queue.length) {
+    const path = queue.shift();
+    const node = path[path.length - 1];
+
+    if (node === destination) return path;
+
+    if (!visited.has(node)) {
+      visited.add(node);
+
+      const neighbours = stationsMap[node]?.neighbours || [];
+      for (const n of neighbours) {
+        queue.push([...path, n]);
+      }
+    }
+  }
+  return null;
+};
+
+// =======================
+// Routes
+// =======================
+
+// Get all stations
+app.get("/name", async (req, res) => {
+  try {
+    res.json(await Station.find({}));
+  } catch {
+    res.status(500).send("Failed to fetch stations");
+  }
+});
+
+// Filter stations (exact code + partial name)
+app.get("/filter", async (req, res) => {
+  try {
+    const search = (req.query.search || "").trim();
+    if (!search) {
+      return res.status(400).json({ message: "Search query required" });
+    }
+
+    const stations = await Station.find({
+      $or: [
+        { code: search.toUpperCase() },
+        { name: { $regex: search, $options: "i" } },
+      ],
+    });
+
+    res.json(stations);
+  } catch {
+    res.status(500).json({ message: "Failed to filter stations" });
+  }
+});
+
+/*
+// =======================
+// Stations Between (GRAPH-BASED)
+// =======================
+app.get("/stations", async (req, res) => {
+  try {
+    const source = (req.query.source || "").toUpperCase();
+    const destination = (req.query.destination || "").toUpperCase();
+
+    if (!source || !destination) {
+      return res.status(400).json({ message: "Source and destination required" });
+    }
+
+    const stations = await Station.find({}).lean();
+
+    // Build map
+    const stationsMap = {};
+    stations.forEach((s) => {
+      stationsMap[s.code.toUpperCase()] = {
+        ...s,
+        neighbours: (s.neighbours || []).map(n => n.toUpperCase())
+      };
+    });
+
+    if (!stationsMap[source] || !stationsMap[destination]) {
+      return res.status(404).json({ message: "Invalid station code" });
+    }
+
+    const pathCodes = findPathBFS(stationsMap, source, destination);
+
+    if (!pathCodes) {
+      return res.status(404).json({ message: "No route found" });
+    }
+
+    const pathStations = pathCodes.map(code => stationsMap[code]);
+    res.json(pathStations);
+
+  } catch {
+    res.status(500).json({ message: "Failed to fetch stations" });
+  }
+});
+
+
+*/
+
+
+
+
+
+app.get("/stations", async (req, res) => {
+  try {
+    const sourceCode = (req.query.source || "").toUpperCase();
+    const destinationCode = (req.query.destination || "").toUpperCase();
+
+    if (!sourceCode || !destinationCode) {
+      return res.status(400).json({ message: "Source and destination required" });
+    }
+
+    // Fetch all stations
+    const stations = await Station.find({}).lean();
+
+    // Precompute valid codes
+    const validCodes = new Set(stations.map(s => s.code.toUpperCase()));
+
+    // Build map: CODE => station data + valid neighbours
+    const stationMap = {};
+    stations.forEach(s => {
+      stationMap[s.code.toUpperCase()] = {
+        ...s,
+        neighbours: (s.neighbours || [])
+          .map(n => n.toUpperCase())
+          .filter(n => validCodes.has(n)), // only include existing stations
+      };
+    });
+
+    // Check if source and destination exist
+    if (!stationMap[sourceCode] || !stationMap[destinationCode]) {
+      return res.status(404).json({ message: "Invalid station code" });
+    }
+
+    // BFS to find path
+    const queue = [[sourceCode]];
+    const visited = new Set();
+    let path = null;
+
+    while (queue.length) {
+      const currentPath = queue.shift();
+      const lastStation = currentPath[currentPath.length - 1];
+
+      if (lastStation === destinationCode) {
+        path = currentPath;
+        break;
+      }
+
+      if (!visited.has(lastStation)) {
+        visited.add(lastStation);
+        stationMap[lastStation].neighbours.forEach(nb => {
+          if (!visited.has(nb)) {
+            queue.push([...currentPath, nb]);
+          }
+        });
+      }
+    }
+
+    if (!path) {
+      return res.status(404).json({ message: "No route found between stations" });
+    }
+
+    // Map codes to full station objects
+    const result = path.map(code => stationMap[code]);
+    res.json(result);
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Failed to fetch stations" });
+  }
+});
+
+
+
+// =======================
+// Fare Calculation (LINE-INDEPENDENT)
+// =======================
+app.get("/stations/fare", async (req, res) => {
+  try {
+    const source = (req.query.source || "").toUpperCase();
+    const destination = (req.query.destination || "").toUpperCase();
+    const persons = parseInt(req.query.persons) || 1;
+
+    const stations = await Station.find({}).lean();
+
+    const stationsMap = {};
+    stations.forEach(s => {
+      stationsMap[s.code.toUpperCase()] = {
+        ...s,
+        neighbours: (s.neighbours || []).map(n => n.toUpperCase())
+      };
+    });
+
+    const path = findPathBFS(stationsMap, source, destination);
+
+    if (!path) {
+      return res.status(404).json({ message: "No route found" });
+    }
+
+    const distance = path.length - 1;
+    const fare = distance * 10 * persons;
+
+    res.json({
+      source,
+      destination,
+      persons,
+      distance,
+      finalFare: fare,
+    });
+
+  } catch {
+    res.status(500).json({ message: "Error calculating fare" });
+  }
+});
+
+// =======================
+// Booking
+// =======================
+app.post("/booking", async (req, res) => {
+  try {
+    const { source, destination, persons = 1 } = req.body;
+
+    const fareRes = await Station.find({});
+    if (!fareRes.length) {
+      return res.status(400).json({ message: "Stations not found" });
+    }
+
+    const booking = await Booking.create({
+      bookingId: uuidv4(),
+      source,
+      destination,
+      persons,
+      fare: persons * 10,
+    });
+
+    res.status(201).json({
+      success: true,
+      bookingId: booking.bookingId,
+      status: booking.status,
+    });
+  } catch {
+    res.status(500).json({ message: "Failed to create booking" });
+  }
+});
+
+// Confirm booking
+app.put("/booking/confirm/:bookingId", async (req, res) => {
+  try {
+    const booking = await Booking.findOneAndUpdate(
+      { bookingId: req.params.bookingId },
+      { status: "CONFIRMED", paymentId: req.body.paymentId },
+      { new: true }
+    );
+
+    if (!booking) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+
+    res.json({ success: true, booking });
+  } catch {
+    res.status(500).json({ message: "Failed to confirm booking" });
+  }
+});
+
+/*
+// Generate QR
+app.get("/booking/qr/:bookingId", async (req, res) => {
+  try {
+    const booking = await Booking.findOne({ bookingId: req.params.bookingId });
+
+    if (!booking || booking.status !== "CONFIRMED") {
+      return res.status(400).json({ message: "QR not available" });
+    }
+
+    const qrPayload = {
+      bookingId: booking.bookingId,
+      source: booking.source,
+      destination: booking.destination,
+      persons: booking.persons,
+      fare: booking.fare,
+      time: booking.createdAt.toLocaleTimeString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        hour12: false
+      })
+    };
+
+    const qrBuffer = await QRCode.toBuffer(JSON.stringify(qrPayload), {
+      type: "png"
+    });
+
+    if (req.accepts("image/png")) {
+      return res.type("image/png").send(qrBuffer);
+    }
+
+    if (req.accepts("text/plain")) {
+      return res.type("text/plain").send(qrBuffer.toString("base64"));
+    }
+
+    return res.status(406).json({
+      message: "Supported formats: image/png, text/plain"
+    });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "QR generation failed" });
+  }
+}); */
+
+
+
+
+
+// =======================
+// Generate QR Code
+// =======================
+app.get("/booking/qr/:bookingId", async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+
+    const booking = await Booking.findOne({ bookingId });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found"
+      });
+    }
+
+    if (booking.status !== "CONFIRMED") {
+      return res.status(400).json({
+        success: false,
+        message: "QR code allowed only for confirmed bookings"
+      });
+    }
+
+    // QR payload
+    const qrPayload = JSON.stringify({
+      bookingId: booking.bookingId,
+      source: booking.source,
+      destination: booking.destination,
+      persons: booking.persons,
+      fare: booking.fare,
+      time: booking.createdAt.toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+        hour12: false
+      })
+    });
+
+    // Generate QR as PNG buffer
+    const qrBuffer = await QRCode.toBuffer(qrPayload, {
+      type: "png",
+      errorCorrectionLevel: "H"
+    });
+
+    // Decide response format
+    const wantsText =
+      req.query.format === "text" ||
+      req.accepts("text/plain");
+
+    const wantsJson =
+      req.query.format === "json" ||
+      req.accepts("application/json");
+
+    // RAW Base64
+    if (wantsText) {
+      res.setHeader("Content-Type", "text/plain");
+      return res.send(qrBuffer.toString("base64"));
+    }
+
+    // JSON Base64
+    if (wantsJson) {
+      return res.json({
+        success: true,
+        bookingId: booking.bookingId,
+        qrBase64: qrBuffer.toString("base64")
+      });
+    }
+
+    // Default → PNG Image
+    res.setHeader("Content-Type", "image/png");
+    return res.send(qrBuffer);
+
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to generate QR code"
+    });
+  }
+});
+
+
+
+// =======================
+// Server Start
+// =======================
+connectDB().then(() => {
+  app.listen(port, () => {
+    console.log(`Server running at http://localhost:${port}`);
+  });
+});
